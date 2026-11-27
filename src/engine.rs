@@ -122,7 +122,7 @@ impl Source {
 
 // ───────────────────────────── Ресемплер ─────────────────────────────
 
-struct Resampler {
+pub(crate) struct Resampler {
     step: f64,
     pos: f64,
     prev: [f32; 2],
@@ -130,12 +130,12 @@ struct Resampler {
 }
 
 impl Resampler {
-    fn new(in_rate: u32, out_rate: u32) -> Self {
+    pub(crate) fn new(in_rate: u32, out_rate: u32) -> Self {
         Self { step: in_rate as f64 / out_rate as f64, pos: 0.0, prev: [0.0; 2], pass: in_rate == out_rate }
     }
 
     /// Линейный ресемплинг стерео interleaved.
-    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+    pub(crate) fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
         if self.pass {
             out.extend_from_slice(input);
             return;
@@ -170,6 +170,7 @@ pub struct Shared {
     pub apps: Mutex<Vec<(String, Arc<Source>)>>,
     pub info: Mutex<Info>,
     pub out_peak: AtomicU32,
+    pub pad: Arc<crate::soundpad::Pad>,
 }
 
 impl Shared {
@@ -179,6 +180,7 @@ impl Shared {
             apps: Mutex::new(Vec::new()),
             info: Mutex::new(Info::default()),
             out_peak: AtomicU32::new(0),
+            pad: crate::soundpad::Pad::new(),
         })
     }
     pub fn out_level(&self) -> f32 {
@@ -359,6 +361,7 @@ where
 {
     let ch = cfg.channels as usize;
     let rate = cfg.sample_rate.0;
+    shared.pad.rate.store(rate, Relaxed);
     let mut mix: Vec<f32> = Vec::new();
     let mut mon_in: Vec<f32> = Vec::new();
     let mut mon_out: Vec<f32> = Vec::new();
@@ -376,6 +379,7 @@ where
                     s.mix_into(&mut mix, rate);
                 }
             }
+            shared.pad.mix_into(&mut mix);
             let monitoring = mon.active.load(Relaxed);
             mon_in.clear();
             let mut pk = 0.0f32;
@@ -627,7 +631,8 @@ impl Engine {
     }
 
     fn apply(&mut self, cfg: Config) {
-        self.shared.mic.set(cfg.mic_volume, cfg.mic_delay_ms, true);
+        self.shared.mic.set(cfg.mic_volume, cfg.mic_delay_ms, !cfg.mic_muted);
+        self.shared.pad.set_master(cfg.pad_volume);
         self.shared.mic.denoise_on.store(cfg.denoise_on, Relaxed);
         self.shared.mic.denoise_amt.store(cfg.denoise_amount.to_bits(), Relaxed);
         self.shared.mic.gate_on.store(cfg.gate_on, Relaxed);
@@ -690,6 +695,7 @@ impl Engine {
         if !self.cfg.running {
             self.drop_inputs();
             self.out = None;
+            self.shared.pad.rate.store(0, Relaxed);
             self.stop_monitor();
             let mut info = self.shared.info.lock().unwrap();
             info.out_status = "Остановлено".into();
@@ -699,6 +705,9 @@ impl Engine {
         }
 
         self.ensure_output(&host);
+        if self.out.is_none() {
+            self.shared.pad.rate.store(0, Relaxed);
+        }
         let Some(rate) = self.out.as_ref().map(|o| o.rate) else {
             self.stop_monitor();
             return;

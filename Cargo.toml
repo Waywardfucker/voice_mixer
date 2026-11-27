@@ -1,6 +1,6 @@
 [package]
 name = "voice-mixer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -13,6 +13,9 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 tray-icon = "0.19"
 winreg = "0.52"
+global-hotkey = "0.6"
+rfd = "0.15"
+symphonia = { version = "0.5", features = ["mp3", "aac", "wav", "ogg", "vorbis", "flac", "pcm", "isomp4"] }
 
 [profile.release]
 opt-level = 3

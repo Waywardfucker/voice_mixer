@@ -47,6 +47,7 @@ fn main() -> eframe::Result<()> {
             .with_title("Voice Mixer")
             .with_inner_size([620.0, 760.0])
             .with_min_inner_size([540.0, 480.0])
+            .with_icon(egui::IconData { rgba: icon_rgba(128), width: 128, height: 128 })
             .with_visible(!hidden),
         ..Default::default()
     };
@@ -318,7 +319,7 @@ impl App {
             }
             ui.checkbox(&mut self.cfg.tray_on_close, "Закрытие окна сворачивает в трей");
             ui.label(
-                RichText::new(format!("Конфиг: {}", Config::path().display())).small().color(DIM),
+                RichText::new("Конфиг: %APPDATA%\\VoiceMixer\\config.toml").small().color(DIM),
             );
         });
     }
@@ -350,17 +351,24 @@ impl eframe::App for App {
 // ───────────────────────────── Виджеты ─────────────────────────────
 
 fn card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::none()
+    let r = egui::Frame::none()
         .fill(CARD)
         .rounding(12.0)
         .stroke(Stroke::new(1.0_f32, BORDER))
-        .inner_margin(14.0)
+        .inner_margin(egui::Margin { left: 18.0, right: 14.0, top: 14.0, bottom: 14.0 })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(RichText::new(title).size(15.0).strong().color(ACCENT_LIGHT));
             ui.add_space(6.0);
             add(ui);
         });
+    // акцентная полоска слева от заголовка
+    let rc = r.response.rect;
+    ui.painter().rect_filled(
+        egui::Rect::from_min_size(egui::pos2(rc.left() + 7.0, rc.top() + 14.0), vec2(3.0, 18.0)),
+        2.0,
+        ACCENT,
+    );
     ui.add_space(10.0);
 }
 
@@ -524,27 +532,40 @@ fn make_tray(ctx: &egui::Context) -> Option<TrayIcon> {
 }
 
 fn make_icon() -> Icon {
-    let n = 32usize;
-    let bars: [(f32, f32, f32); 3] = [(9.0, 13.0, 7.0), (14.0, 18.0, 11.0), (19.0, 23.0, 5.0)];
-    let mut rgba = Vec::with_capacity(n * n * 4);
+    Icon::from_rgba(icon_rgba(32), 32, 32).expect("icon")
+}
+
+/// Иконка: фиолетовый круг с тремя белыми «столбиками» уровня. Рисуется в любом размере (сглаживание 3×3).
+fn icon_rgba(n: usize) -> Vec<u8> {
+    let bars: [(f32, f32, f32); 3] = [(9.5, 13.5, 7.0), (14.5, 18.5, 11.0), (19.5, 23.5, 5.0)];
+    let k = 32.0 / n as f32;
+    let mut out = Vec::with_capacity(n * n * 4);
     for y in 0..n {
         for x in 0..n {
-            let (fx, fy) = (x as f32, y as f32);
-            let (dx, dy) = (fx - 15.5, fy - 15.5);
-            let d = (dx * dx + dy * dy).sqrt();
-            if d < 14.0 {
-                let in_bar = bars.iter().any(|(a, b, h)| fx >= *a && fx < *b && dy.abs() < *h);
-                if in_bar {
-                    rgba.extend_from_slice(&[255, 255, 255, 255]);
-                } else {
-                    rgba.extend_from_slice(&[124, 92, 255, 255]);
+            let (mut r, mut g, mut b, mut cov) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for sy in 0..3 {
+                for sx in 0..3 {
+                    let fx = (x as f32 + (sx as f32 + 0.5) / 3.0) * k;
+                    let fy = (y as f32 + (sy as f32 + 0.5) / 3.0) * k;
+                    let (dx, dy) = (fx - 16.0, fy - 16.0);
+                    if (dx * dx + dy * dy).sqrt() < 14.5 {
+                        let in_bar = bars.iter().any(|(a, c, h)| fx >= *a && fx < *c && dy.abs() < *h);
+                        let col = if in_bar { [255.0, 255.0, 255.0] } else { [124.0, 92.0, 255.0] };
+                        r += col[0];
+                        g += col[1];
+                        b += col[2];
+                        cov += 1.0;
+                    }
                 }
+            }
+            if cov > 0.0 {
+                out.extend_from_slice(&[(r / cov) as u8, (g / cov) as u8, (b / cov) as u8, (cov / 9.0 * 255.0) as u8]);
             } else {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
+                out.extend_from_slice(&[0, 0, 0, 0]);
             }
         }
     }
-    Icon::from_rgba(rgba, n as u32, n as u32).expect("icon")
+    out
 }
 
 // ───────────────────────────── Автозапуск ─────────────────────────────

@@ -839,6 +839,17 @@ impl Engine {
                 break;
             }
         }
+        // Список пуст — берём микрофон Windows по умолчанию (кроме кабеля вывода, чтобы не зациклить звук)
+        if want.is_none() && self.cfg.mics.iter().all(|m| m.trim().is_empty()) {
+            if let Some(d) = host.default_input_device() {
+                if let Ok(n) = d.name() {
+                    let out = self.cfg.output.trim().to_lowercase();
+                    if out.is_empty() || !n.to_lowercase().contains(&out) {
+                        want = Some((d, n));
+                    }
+                }
+            }
+        }
         match want {
             None => {
                 self.mic = None;

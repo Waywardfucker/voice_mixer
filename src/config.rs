@@ -47,7 +47,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             output: "Line 2".into(),
-            mics: vec!["fifine SC8".into(), "MCHOSE".into(), "TONOR".into()],
+            mics: vec![],
             mic_volume: 1.0,
             mic_delay_ms: 0.0,
             apps: vec![

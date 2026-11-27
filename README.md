@@ -1,6 +1,6 @@
 # Voice Mixer
 
-<!-- ![Скриншот](docs/screenshot.png) -->
+![Скриншот](docs/screenshot.png)
 
 [![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)](https://www.rust-lang.org/)
 [![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D6?logo=windows)](https://www.microsoft.com/windows)

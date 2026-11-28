@@ -76,6 +76,9 @@ const PRESETS: [(&str, &str); 6] = [
 
 fn main() -> eframe::Result<()> {
     let minimized = std::env::args().any(|a| a == "--minimized");
+    if !acquire_single_instance(minimized) {
+        return Ok(());
+    }
     let cfg = Config::load();
     cfg.save();
     set_theme(&cfg.theme);
@@ -342,6 +345,7 @@ impl App {
             dirty: dirty.clone(),
         });
         start_hotkey_thread(ctx.clone(), hk_map.clone(), rt);
+        start_show_listener(ctx.clone());
         Self {
             cfg,
             tx,
@@ -1594,6 +1598,57 @@ extern "system" {
     fn GetCurrentProcess() -> isize;
     fn K32EmptyWorkingSet(process: isize) -> i32;
     fn K32GetProcessMemoryInfo(process: isize, counters: *mut ProcMemCounters, cb: u32) -> i32;
+    fn CreateMutexW(attrs: *const std::ffi::c_void, initial_owner: i32, name: *const u16) -> isize;
+    fn CreateEventW(attrs: *const std::ffi::c_void, manual_reset: i32, initial_state: i32, name: *const u16) -> isize;
+    fn SetEvent(handle: isize) -> i32;
+    fn WaitForSingleObject(handle: isize, millis: u32) -> u32;
+    fn GetLastError() -> u32;
+}
+
+// ───────────────────────────── Один экземпляр программы
+
+static INSTANCE_MUTEX: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static SHOW_EVENT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// true — это первая копия, можно продолжать запуск.
+/// false — копия уже запущена: ей отправлен сигнал показать окно (если запуск не автозапуском в трей).
+fn acquire_single_instance(quiet: bool) -> bool {
+    unsafe {
+        let m = CreateMutexW(std::ptr::null(), 0, wide("Local\\VoiceMixer.SingleInstance").as_ptr());
+        let already = m != 0 && GetLastError() == 183; // ERROR_ALREADY_EXISTS
+        let ev = CreateEventW(std::ptr::null(), 0, 0, wide("Local\\VoiceMixer.ShowWindow").as_ptr());
+        if already {
+            if !quiet && ev != 0 {
+                SetEvent(ev);
+            }
+            return false;
+        }
+        // дескрипторы живут до конца процесса: пока он работает, вторая копия не запустится
+        INSTANCE_MUTEX.store(m, Ordering::Relaxed);
+        SHOW_EVENT.store(ev, Ordering::Relaxed);
+        true
+    }
+}
+
+/// Ждёт сигнала от второй копии и показывает окно этой.
+fn start_show_listener(ctx: egui::Context) {
+    let ev = SHOW_EVENT.load(Ordering::Relaxed);
+    if ev == 0 {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("single-instance".into())
+        .spawn(move || loop {
+            if unsafe { WaitForSingleObject(ev, 0xFFFF_FFFF) } != 0 {
+                break;
+            }
+            show_window(&ctx);
+        })
+        .ok();
 }
 
 /// Вернуть системе неиспользуемые страницы памяти (в диспетчере задач потребление заметно падает).

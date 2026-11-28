@@ -346,7 +346,7 @@ impl App {
         });
         start_hotkey_thread(ctx.clone(), hk_map.clone(), rt);
         start_show_listener(ctx.clone());
-        Self {
+        let mut app = Self {
             cfg,
             tx,
             shared,
@@ -374,7 +374,10 @@ impl App {
             profile_name: String::new(),
             profiles: Config::list_profiles(),
             io_msg: String::new(),
-        }
+        };
+        app.sync_hotkeys(false);
+        app.hk_sig = signature(&app.cfg);
+        app
     }
 
     /// Перерегистрировать глобальные горячие клавиши по текущему конфигу.
@@ -1603,6 +1606,61 @@ extern "system" {
     fn SetEvent(handle: isize) -> i32;
     fn WaitForSingleObject(handle: isize, millis: u32) -> u32;
     fn GetLastError() -> u32;
+    fn GetCurrentProcessId() -> u32;
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn EnumWindows(callback: extern "system" fn(isize, isize) -> i32, lparam: isize) -> i32;
+    fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
+    fn GetWindowTextW(hwnd: isize, buf: *mut u16, max_count: i32) -> i32;
+    fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
+    fn IsIconic(hwnd: isize) -> i32;
+    fn BringWindowToTop(hwnd: isize) -> i32;
+    fn SetForegroundWindow(hwnd: isize) -> i32;
+}
+
+extern "system" fn find_window_cb(hwnd: isize, lparam: isize) -> i32 {
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == GetCurrentProcessId() {
+            let mut buf = [0u16; 64];
+            let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), 64);
+            if n > 0 && String::from_utf16_lossy(&buf[..n as usize]) == "Voice Mixer" {
+                *(lparam as *mut isize) = hwnd;
+                return 0; // нашли, перебор окон можно остановить
+            }
+        }
+    }
+    1
+}
+
+/// Окно программы средствами Windows (0 — не найдено).
+fn find_own_window() -> isize {
+    let mut found: isize = 0;
+    unsafe {
+        EnumWindows(find_window_cb, &mut found as *mut isize as isize);
+    }
+    found
+}
+
+/// Показать и вывести на передний план окно напрямую через Windows.
+/// Команды egui применяются только во время кадра, а скрытое окно кадры может не получать,
+/// поэтому без этого окно из трея иногда не возвращалось.
+fn native_show_window() {
+    let h = find_own_window();
+    if h == 0 {
+        return;
+    }
+    unsafe {
+        ShowWindow(h, 5); // SW_SHOW
+        if IsIconic(h) != 0 {
+            ShowWindow(h, 9); // SW_RESTORE
+        }
+        BringWindowToTop(h);
+        SetForegroundWindow(h);
+    }
 }
 
 // ───────────────────────────── Один экземпляр программы
@@ -1684,6 +1742,7 @@ fn proc_mem_mb() -> (usize, usize) {
 
 fn show_window(ctx: &egui::Context) {
     VISIBLE.store(true, Ordering::Relaxed);
+    native_show_window();
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);

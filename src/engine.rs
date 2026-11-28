@@ -583,6 +583,9 @@ struct Engine {
     mon: Arc<Monitor>,
     mon_out: Option<OutRt>,
     mon_err: Arc<AtomicBool>,
+    last_scan: Option<Instant>,
+    scan_now: bool,
+    last_proc: Option<Instant>,
 }
 
 pub fn spawn(shared: Arc<Shared>, cfg: Config) -> Sender<Config> {
@@ -625,6 +628,9 @@ impl Engine {
             mon: Monitor::new(),
             mon_out: None,
             mon_err: Arc::new(AtomicBool::new(false)),
+            last_scan: None,
+            scan_now: true,
+            last_proc: None,
         };
         e.apply(cfg);
         e
@@ -667,6 +673,7 @@ impl Engine {
         *self.shared.apps.lock().unwrap() = ordered;
 
         self.cfg = cfg;
+        self.scan_now = true;
     }
 
     fn drop_inputs(&mut self) {
@@ -677,6 +684,22 @@ impl Engine {
     }
 
     fn tick(&mut self) {
+        // Перечисление устройств в WASAPI дорогое и со временем раздувает память, поэтому когда всё работает,
+        // устройства опрашиваются редко (раз в 15 с), а при проблемах или после смены настроек — сразу.
+        let errors = self.out_err.load(Relaxed) || self.mic_err.load(Relaxed) || self.mon_err.load(Relaxed);
+        let healthy = !self.cfg.running
+            || (self.out.is_some() && self.mic.is_some() && (!self.cfg.monitor_on || self.mon_out.is_some()));
+        let interval = Duration::from_secs(if healthy { 15 } else { 3 });
+        let due = self.last_scan.map_or(true, |t| t.elapsed() >= interval);
+        if !(self.scan_now || errors || due) {
+            if let Some(rate) = self.out.as_ref().map(|o| o.rate) {
+                self.ensure_apps(rate);
+            }
+            return;
+        }
+        self.scan_now = false;
+        self.last_scan = Some(Instant::now());
+
         let host = cpal::default_host();
         {
             let ins: Vec<String> = host
@@ -886,7 +909,10 @@ impl Engine {
     }
 
     fn ensure_apps(&mut self, rate: u32) {
-        self.sys.refresh_processes(ProcessesToUpdate::All, true);
+        if self.last_proc.map_or(true, |t| t.elapsed() >= Duration::from_secs(2)) {
+            self.sys.refresh_processes(ProcessesToUpdate::All, true);
+            self.last_proc = Some(Instant::now());
+        }
         for a in self.apps.iter_mut() {
             let enabled = self
                 .cfg

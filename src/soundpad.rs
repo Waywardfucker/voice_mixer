@@ -4,7 +4,7 @@
 use crate::engine::Resampler;
 use std::collections::HashMap;
 use std::fs::File;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
@@ -15,7 +15,11 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 /// Максимальная длина одного звука (дальше обрезается), чтобы не занимать много памяти.
-const MAX_SECONDS: usize = 180;
+const MAX_SECONDS: usize = 120;
+/// Предел памяти под кэш декодированных звуков (самые давно не игравшие выгружаются).
+const CACHE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
+/// Декодирование по одному файлу за раз, чтобы не раздувать память пиками.
+static DECODE_LOCK: Mutex<()> = Mutex::new(());
 /// Максимум одновременно играющих звуков.
 const MAX_VOICES: usize = 16;
 
@@ -29,9 +33,15 @@ struct Voice {
     path: String,
 }
 
+struct CacheEntry {
+    data: Arc<Vec<f32>>,
+    used: u64,
+}
+
 pub struct Pad {
     voices: Mutex<Vec<Voice>>,
-    cache: Mutex<HashMap<(String, u32), Arc<Vec<f32>>>>,
+    cache: Mutex<HashMap<(String, u32), CacheEntry>>,
+    clock: AtomicU64,
     /// Частота устройства вывода (0 — вывод не работает).
     pub rate: AtomicU32,
     master: AtomicU32,
@@ -43,6 +53,7 @@ impl Pad {
         Arc::new(Self {
             voices: Mutex::new(Vec::new()),
             cache: Mutex::new(HashMap::new()),
+            clock: AtomicU64::new(0),
             rate: AtomicU32::new(0),
             master: AtomicU32::new(1.0f32.to_bits()),
             status: Mutex::new(String::new()),
@@ -67,6 +78,38 @@ impl Pad {
 
     pub fn stop(&self, path: &str) {
         self.voices.lock().unwrap().retain(|v| v.path != path);
+    }
+
+    /// Сколько памяти занимает кэш декодированных звуков, в байтах.
+    pub fn cache_bytes(&self) -> usize {
+        self.cache.lock().unwrap().values().map(|e| e.data.len() * 4).sum()
+    }
+
+    /// Очистить кэш (кроме звуков, которые играют прямо сейчас).
+    pub fn clear_cache(&self) {
+        self.cache.lock().unwrap().retain(|_, e| Arc::strong_count(&e.data) > 1);
+    }
+
+    fn insert_cache(&self, key: (String, u32), data: Arc<Vec<f32>>) {
+        let tick = self.clock.fetch_add(1, Relaxed);
+        let mut c = self.cache.lock().unwrap();
+        c.insert(key.clone(), CacheEntry { data, used: tick });
+        let mut total: usize = c.values().map(|e| e.data.len() * 4).sum();
+        while total > CACHE_BUDGET_BYTES {
+            let victim = c
+                .iter()
+                .filter(|(k, e)| **k != key && Arc::strong_count(&e.data) == 1)
+                .min_by_key(|(_, e)| e.used)
+                .map(|(k, _)| k.clone());
+            match victim {
+                Some(k) => {
+                    if let Some(e) = c.remove(&k) {
+                        total -= e.data.len() * 4;
+                    }
+                }
+                None => break,
+            }
+        }
     }
 
     /// Убрать из кэша звуки, которых больше нет в списке.
@@ -121,22 +164,31 @@ impl Pad {
             *self.status.lock().unwrap() = "Микшер остановлен: звуку некуда играть".into();
             return;
         }
-        let cached = self.cache.lock().unwrap().get(&(path.to_string(), rate)).cloned();
+        let cached = {
+            let mut c = self.cache.lock().unwrap();
+            c.get_mut(&(path.to_string(), rate)).map(|e| {
+                e.used = self.clock.fetch_add(1, Relaxed);
+                e.data.clone()
+            })
+        };
         if let Some(d) = cached {
             self.start(d, path, vol, looped);
             return;
         }
         let me = self.clone();
         let path = path.to_string();
-        std::thread::spawn(move || match decode_file(&path, rate) {
+        std::thread::spawn(move || {
+            let _g = DECODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            match decode_file(&path, rate) {
             Ok(d) => {
                 let d = Arc::new(d);
-                me.cache.lock().unwrap().insert((path.clone(), rate), d.clone());
+                me.insert_cache((path.clone(), rate), d.clone());
                 me.start(d, &path, vol, looped);
                 me.status.lock().unwrap().clear();
             }
             Err(e) => {
                 *me.status.lock().unwrap() = format!("{}: {e}", short_name(&path));
+            }
             }
         });
     }
@@ -149,12 +201,13 @@ impl Pad {
         }
         let me = self.clone();
         let path = path.to_string();
-        std::thread::spawn(move || match decode_file(&path, rate) {
-            Ok(d) => {
-                me.cache.lock().unwrap().insert((path.clone(), rate), Arc::new(d));
-            }
-            Err(e) => {
-                *me.status.lock().unwrap() = format!("{}: {e}", short_name(&path));
+        std::thread::spawn(move || {
+            let _g = DECODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            match decode_file(&path, rate) {
+                Ok(d) => me.insert_cache((path.clone(), rate), Arc::new(d)),
+                Err(e) => {
+                    *me.status.lock().unwrap() = format!("{}: {e}", short_name(&path));
+                }
             }
         });
     }
@@ -244,5 +297,6 @@ fn decode_file(path: &str, out_rate: u32) -> Result<Vec<f32>, String> {
     if out.len() % 2 != 0 {
         out.pop();
     }
+    out.shrink_to_fit();
     Ok(out)
 }

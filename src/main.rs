@@ -14,7 +14,7 @@ use eframe::egui::{self, Align, Color32, Layout, RichText, Rounding, Sense, Stro
 use engine::Shared;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use winreg::{enums::HKEY_CURRENT_USER, RegKey};
@@ -84,6 +84,7 @@ fn main() -> eframe::Result<()> {
     let tx = engine::spawn(shared.clone(), cfg.clone());
 
     let hidden = minimized && cfg.tray_on_close;
+    VISIBLE.store(!hidden, Ordering::Relaxed);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Voice Mixer")
@@ -290,6 +291,7 @@ struct App {
     capture: Option<Target>,
     capture_msg: String,
     preloaded_rate: u32,
+    last_trim: Instant,
     // профили и конфиги
     profile_name: String,
     profiles: Vec<String>,
@@ -326,6 +328,7 @@ impl App {
             capture: None,
             capture_msg: String::new(),
             preloaded_rate: 0,
+            last_trim: Instant::now(),
             profile_name: String::new(),
             profiles: Config::list_profiles(),
             io_msg: String::new(),
@@ -978,6 +981,29 @@ impl App {
             }
         });
 
+        card(ui, "Диагностика", |ui| {
+            let (ws, private) = proc_mem_mb();
+            ui.label(format!("Память процесса: {ws} МБ, из них приватная {private} МБ"));
+            ui.label(format!(
+                "Кэш звуков Soundpad: {:.0} МБ из {} МБ",
+                self.shared.pad.cache_bytes() as f64 / 1_048_576.0,
+                192
+            ));
+            ui.horizontal(|ui| {
+                if ui.button("Очистить кэш звуков").clicked() {
+                    self.shared.pad.clear_cache();
+                }
+                if ui.button("Освободить память").clicked() {
+                    trim_memory();
+                }
+            });
+            ui.label(
+                RichText::new("Приватная память показывает реальное потребление. Если она постоянно растёт, создайте Issue на GitHub.")
+                    .small()
+                    .color(pal().dim),
+            );
+        });
+
         // ── Настройки ──
         card(ui, "Настройки", |ui| {
             if ui.checkbox(&mut self.autostart, "Запускать вместе с Windows (свёрнутым в трей)").changed() {
@@ -996,6 +1022,9 @@ impl eframe::App for App {
         if ctx.input(|i| i.viewport().close_requested()) && self.cfg.tray_on_close && self.tray.is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            VISIBLE.store(false, Ordering::Relaxed);
+            trim_memory();
+            self.last_trim = Instant::now();
         }
 
         // изменения, сделанные горячими клавишами
@@ -1025,14 +1054,18 @@ impl eframe::App for App {
             }
         }
 
+        let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
+        let visible = VISIBLE.load(Ordering::Relaxed) && !minimized;
         let before = self.cfg.clone();
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(pal().bg).inner_margin(16.0))
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.ui(ui);
+        if visible {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(pal().bg).inner_margin(16.0))
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        self.ui(ui);
+                    });
                 });
-            });
+        }
         if self.cfg != before {
             self.cfg.save();
             let _ = self.tx.send(self.cfg.clone());
@@ -1054,7 +1087,20 @@ impl eframe::App for App {
             self.sync_hotkeys(sig == "~capture");
         }
 
-        ctx.request_repaint_after(Duration::from_millis(60));
+        // Частота перерисовки: быстро только когда окно открыто и есть что анимировать.
+        let playing = self.shared.pad.playing() > 0;
+        let ms = if !visible {
+            if self.last_trim.elapsed() >= Duration::from_secs(60) {
+                trim_memory();
+                self.last_trim = Instant::now();
+            }
+            1500
+        } else if self.tab == Tab::Mixer || self.capture.is_some() || playing {
+            60
+        } else {
+            250
+        };
+        ctx.request_repaint_after(Duration::from_millis(ms));
     }
 }
 
@@ -1200,7 +1246,63 @@ fn apply_style(ctx: &egui::Context) {
 
 // ───────────────────────────── Трей ─────────────────────────────
 
+/// Окно видно на экране (не в трее и не свёрнуто). Когда нет, интерфейс не рисуется.
+static VISIBLE: AtomicBool = AtomicBool::new(true);
+
+#[repr(C)]
+struct ProcMemCounters {
+    cb: u32,
+    page_fault_count: u32,
+    peak_working_set: usize,
+    working_set: usize,
+    quota_peak_paged: usize,
+    quota_paged: usize,
+    quota_peak_nonpaged: usize,
+    quota_nonpaged: usize,
+    pagefile: usize,
+    peak_pagefile: usize,
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentProcess() -> isize;
+    fn K32EmptyWorkingSet(process: isize) -> i32;
+    fn K32GetProcessMemoryInfo(process: isize, counters: *mut ProcMemCounters, cb: u32) -> i32;
+}
+
+/// Вернуть системе неиспользуемые страницы памяти (в диспетчере задач потребление заметно падает).
+fn trim_memory() {
+    unsafe {
+        K32EmptyWorkingSet(GetCurrentProcess());
+    }
+}
+
+/// (рабочий набор, приватная память) процесса в МБ.
+fn proc_mem_mb() -> (usize, usize) {
+    unsafe {
+        let mut c = ProcMemCounters {
+            cb: std::mem::size_of::<ProcMemCounters>() as u32,
+            page_fault_count: 0,
+            peak_working_set: 0,
+            working_set: 0,
+            quota_peak_paged: 0,
+            quota_paged: 0,
+            quota_peak_nonpaged: 0,
+            quota_nonpaged: 0,
+            pagefile: 0,
+            peak_pagefile: 0,
+        };
+        let cb = c.cb;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, cb) != 0 {
+            (c.working_set / 1_048_576, c.pagefile / 1_048_576)
+        } else {
+            (0, 0)
+        }
+    }
+}
+
 fn show_window(ctx: &egui::Context) {
+    VISIBLE.store(true, Ordering::Relaxed);
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);

@@ -28,11 +28,24 @@ pub struct SoundCfg {
     pub looped: bool,
     /// Глобальный бинд, например «Ctrl+Alt+1». Пусто — без бинда.
     pub key: String,
+    /// Группа для фильтра в списке звуков (пусто — без группы).
+    pub group: String,
+    /// None — как в настройках Soundpad, Some(true) — останавливает другие звуки,
+    /// Some(false) — играет поверх остальных, не прерывая их.
+    pub exclusive: Option<bool>,
 }
 
 impl Default for SoundCfg {
     fn default() -> Self {
-        Self { name: String::new(), path: String::new(), volume: 1.0, looped: false, key: String::new() }
+        Self {
+            name: String::new(),
+            path: String::new(),
+            volume: 1.0,
+            looped: false,
+            key: String::new(),
+            group: String::new(),
+            exclusive: None,
+        }
     }
 }
 
@@ -80,6 +93,16 @@ pub struct Config {
     pub theme: String,
     /// Общая громкость Soundpad
     pub pad_volume: f32,
+    /// Новый звук останавливает предыдущий (по умолчанию для всех звуков)
+    pub pad_exclusive: bool,
+    /// Разрешить бинды звуков без Ctrl/Alt/Shift
+    pub pad_allow_bare: bool,
+    /// Громкость, с которой добавляются новые звуки
+    pub pad_default_volume: f32,
+    /// Вид списка звуков: «Плитки» или «Список»
+    pub pad_view: String,
+    /// Сколько звуков на странице (0 — все)
+    pub pad_per_page: u32,
     pub sounds: Vec<SoundCfg>,
     pub binds: Vec<BindCfg>,
 }
@@ -109,6 +132,11 @@ impl Default for Config {
             gate_depth_db: 40.0,
             theme: "Фиолет".into(),
             pad_volume: 1.0,
+            pad_exclusive: false,
+            pad_allow_bare: false,
+            pad_default_volume: 1.0,
+            pad_view: "Плитки".into(),
+            pad_per_page: 24,
             sounds: vec![],
             binds: vec![],
         }

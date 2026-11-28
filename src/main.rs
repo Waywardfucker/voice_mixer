@@ -140,13 +140,8 @@ impl HotRt {
     fn run(&self, act: Act, ctx: &egui::Context) {
         match act {
             Act::Sound(i) => {
-                let sound = {
-                    let c = self.cfg.lock().unwrap();
-                    c.sounds.get(i).map(|s| (s.path.clone(), s.volume, s.looped))
-                };
-                if let Some((path, vol, looped)) = sound {
-                    self.shared.pad.play(&path, vol, looped);
-                }
+                let c = self.cfg.lock().unwrap();
+                play_cfg_sound(&self.shared, &c, i);
             }
             Act::Action(name) => {
                 if name == "stop_sounds" {
@@ -261,6 +256,35 @@ fn is_fkey(name: &str) -> bool {
     name.len() > 1 && name.starts_with('F') && name[1..].chars().all(|c| c.is_ascii_digit())
 }
 
+/// Значение фильтра «Без группы» (служебная строка, не совпадает с названием группы).
+const NO_GROUP: &str = "\u{1}no-group";
+
+/// Выбор режима воспроизведения звука.
+fn mode_combo(ui: &mut egui::Ui, id: impl std::hash::Hash, v: &mut Option<bool>) {
+    let label = match *v {
+        None => "как в настройках",
+        Some(true) => "останавливает другие",
+        Some(false) => "играет поверх",
+    };
+    egui::ComboBox::from_id_salt(id).selected_text(label).show_ui(ui, |ui| {
+        ui.selectable_value(v, None, "как в настройках");
+        ui.selectable_value(v, Some(true), "останавливает другие");
+        ui.selectable_value(v, Some(false), "играет поверх");
+    });
+}
+
+/// Проиграть звук `i` из конфига с учётом режима (общего или своего).
+fn play_cfg_sound(shared: &Shared, cfg: &Config, i: usize) {
+    if let Some(s) = cfg.sounds.get(i) {
+        let (exclusive, layer) = match s.exclusive {
+            Some(true) => (true, false),
+            Some(false) => (false, true),
+            None => (cfg.pad_exclusive, false),
+        };
+        shared.pad.play(&s.path, s.volume, s.looped, exclusive, layer);
+    }
+}
+
 fn add_sound(cfg: &mut Config, path: &str) -> bool {
     let p = std::path::Path::new(path);
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
@@ -268,7 +292,8 @@ fn add_sound(cfg: &mut Config, path: &str) -> bool {
         return false;
     }
     let name = p.file_stem().and_then(|n| n.to_str()).unwrap_or("звук").to_string();
-    cfg.sounds.push(SoundCfg { name, path: path.to_string(), ..Default::default() });
+    let volume = cfg.pad_default_volume;
+    cfg.sounds.push(SoundCfg { name, path: path.to_string(), volume, ..Default::default() });
     true
 }
 
@@ -292,6 +317,13 @@ struct App {
     capture_msg: String,
     preloaded_rate: u32,
     last_trim: Instant,
+    // Soundpad: поиск, фильтры, страницы
+    pad_search: String,
+    pad_group: String,
+    pad_page: usize,
+    pad_sort: bool,
+    pad_filter_sig: String,
+    pad_remove: Option<usize>,
     // профили и конфиги
     profile_name: String,
     profiles: Vec<String>,
@@ -329,6 +361,12 @@ impl App {
             capture_msg: String::new(),
             preloaded_rate: 0,
             last_trim: Instant::now(),
+            pad_search: String::new(),
+            pad_group: String::new(),
+            pad_page: 0,
+            pad_sort: false,
+            pad_filter_sig: String::new(),
+            pad_remove: None,
             profile_name: String::new(),
             profiles: Config::list_profiles(),
             io_msg: String::new(),
@@ -406,8 +444,9 @@ impl App {
                 if modifiers.shift {
                     parts.push("Shift".into());
                 }
-                if parts.is_empty() && !is_fkey(&name) {
-                    self.capture_msg = "Добавьте Ctrl, Alt или Shift (без них можно только F1–F24)".into();
+                if parts.is_empty() && !is_fkey(&name) && !self.cfg.pad_allow_bare {
+                    self.capture_msg =
+                        "Добавьте Ctrl, Alt или Shift (без них только F1–F24; одиночные клавиши включаются в «Настройки» → Soundpad)".into();
                     continue;
                 }
                 parts.push(name);
@@ -511,55 +550,13 @@ impl App {
         let info = self.shared.info.lock().unwrap().clone();
         let shared = self.shared.clone();
 
-        // ── Выход ──
-        card(ui, "Выход · виртуальный кабель", |ui| {
+        // ── Итоговый уровень ──
+        card(ui, "Итоговый уровень", |ui| {
             ui.horizontal(|ui| {
-                ui.label("Имя содержит:");
-                ui.add(TextEdit::singleline(&mut self.cfg.output).desired_width(190.0));
-                egui::ComboBox::from_id_salt("out_pick").selected_text("Выбрать…").show_ui(ui, |ui| {
-                    for d in &info.out_devices {
-                        if ui.selectable_label(false, d).clicked() {
-                            self.cfg.output = d.clone();
-                        }
-                    }
-                });
-            });
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Итоговый уровень").small().color(pal().dim));
+                ui.label(RichText::new("На выходе").small().color(pal().dim));
                 meter(ui, shared.out_level(), ui.available_width());
             });
-        });
-
-        // ── Прослушивание ──
-        card(ui, "Прослушивание · что уходит в Line 2", |ui| {
-            ui.checkbox(&mut self.cfg.monitor_on, "Слышать итоговый микс в этом устройстве");
-            ui.horizontal(|ui| {
-                ui.label("Устройство:");
-                ui.add(TextEdit::singleline(&mut self.cfg.monitor_device).desired_width(190.0));
-                egui::ComboBox::from_id_salt("mon_pick").selected_text("Выбрать…").show_ui(ui, |ui| {
-                    for d in &info.out_devices {
-                        if ui.selectable_label(false, d).clicked() {
-                            self.cfg.monitor_device = d.clone();
-                        }
-                    }
-                });
-            });
-            ui.horizontal(|ui| {
-                ui.label("Громкость");
-                ui.add(
-                    egui::Slider::new(&mut self.cfg.monitor_volume, 0.0..=5.0)
-                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
-                        .custom_parser(|s| s.trim().trim_end_matches('%').parse::<f64>().ok().map(|x| x / 100.0)),
-                );
-            });
-            if !info.monitor_status.is_empty() {
-                ui.label(RichText::new(&info.monitor_status).small().color(pal().dim));
-            }
-            ui.label(
-                RichText::new("Музыка в наушниках играет ещё и напрямую, поэтому здесь она может звучать с эхом — для проверки баланса это нормально.")
-                    .small()
-                    .color(pal().dim),
-            );
+            ui.label(RichText::new("Выбор выхода и прослушивание находятся на вкладке «Настройки».").small().color(pal().dim));
         });
 
         // ── Микрофоны ──
@@ -723,10 +720,14 @@ impl App {
         });
     }
 
+    fn play_sound(&self, i: usize) {
+        play_cfg_sound(&self.shared, &self.cfg, i);
+    }
+
     fn ui_pad(&mut self, ui: &mut egui::Ui) {
         let shared = self.shared.clone();
         card(ui, "Soundpad · звуки в микс", |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("Добавить звуки…").clicked() {
                     if let Some(files) = rfd::FileDialog::new().add_filter("Аудио", &soundpad::EXTENSIONS).pick_files() {
                         for f in files {
@@ -740,6 +741,7 @@ impl App {
                 if ui.button("Стоп всё").clicked() {
                     shared.pad.stop_all();
                 }
+                ui.checkbox(&mut self.cfg.pad_exclusive, "Новый звук останавливает предыдущий");
                 ui.label(RichText::new(format!("играет: {}", shared.pad.playing())).small().color(pal().dim));
             });
             ui.horizontal(|ui| {
@@ -750,10 +752,19 @@ impl App {
                         .custom_parser(|s| s.trim().trim_end_matches('%').parse::<f64>().ok().map(|x| x / 100.0)),
                 );
             });
+            if self.capture.is_some() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Назначение бинда: нажмите сочетание клавиш").color(YELLOW));
+                    if ui.small_button("Отмена").clicked() {
+                        self.capture = None;
+                        self.capture_msg.clear();
+                    }
+                });
+            }
             ui.label(
                 RichText::new(
                     "Перетащите файлы в окно или нажмите «Добавить звуки…» (mp3, wav, ogg, flac, m4a). \
-                     Звук уходит в тот же микс, что и микрофон, и слышен в наушниках при включённом прослушивании.",
+                     Клик по плитке — играть, правый клик — переименовать, бинд, громкость, группа.",
                 )
                 .small()
                 .color(pal().dim),
@@ -771,47 +782,281 @@ impl App {
         card(ui, &format!("Звуки · {n}"), |ui| {
             if n == 0 {
                 ui.label(RichText::new("Пока пусто.").color(pal().dim));
+                return;
             }
-            let mut remove: Option<usize> = None;
-            for i in 0..n {
-                ui.horizontal(|ui| {
-                    ui.add(TextEdit::singleline(&mut self.cfg.sounds[i].name).desired_width(160.0));
-                    if ui.button("Играть").clicked() {
-                        let s = &self.cfg.sounds[i];
-                        shared.pad.play(&s.path, s.volume, s.looped);
-                    }
-                    let key = self.cfg.sounds[i].key.clone();
-                    self.key_button(ui, Target::Sound(i), &key);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if icon_btn(ui, Ic::Close) {
-                            remove = Some(i);
-                        }
-                    });
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Громкость");
-                    ui.add(
-                        egui::Slider::new(&mut self.cfg.sounds[i].volume, 0.0..=3.0)
-                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
-                            .custom_parser(|s| s.trim().trim_end_matches('%').parse::<f64>().ok().map(|x| x / 100.0)),
-                    );
-                    ui.checkbox(&mut self.cfg.sounds[i].looped, "зациклить (повторное нажатие — стоп)");
-                });
-                ui.label(RichText::new(&self.cfg.sounds[i].path).small().color(pal().dim));
-                if i + 1 < n {
-                    ui.add_space(2.0);
-                    ui.separator();
+
+            // ── поиск и фильтры ──
+            let mut groups: Vec<String> = self
+                .cfg
+                .sounds
+                .iter()
+                .map(|s| s.group.trim().to_string())
+                .filter(|g| !g.is_empty())
+                .collect();
+            groups.sort();
+            groups.dedup();
+            if !self.pad_group.is_empty() && self.pad_group != NO_GROUP && !groups.contains(&self.pad_group) {
+                self.pad_group.clear();
+            }
+            ui.horizontal(|ui| {
+                ui.add(
+                    TextEdit::singleline(&mut self.pad_search)
+                        .hint_text("Поиск: название, группа или бинд")
+                        .desired_width(260.0),
+                );
+                if !self.pad_search.is_empty() && ui.small_button("сбросить").clicked() {
+                    self.pad_search.clear();
                 }
+            });
+            ui.horizontal_wrapped(|ui| {
+                let sel_text = if self.pad_group.is_empty() {
+                    "Все группы".to_string()
+                } else if self.pad_group == NO_GROUP {
+                    "Без группы".to_string()
+                } else {
+                    self.pad_group.clone()
+                };
+                egui::ComboBox::from_id_salt("pad_group").width(150.0).selected_text(sel_text).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.pad_group, String::new(), "Все группы");
+                    ui.selectable_value(&mut self.pad_group, NO_GROUP.to_string(), "Без группы");
+                    for g in &groups {
+                        ui.selectable_value(&mut self.pad_group, g.clone(), g.as_str());
+                    }
+                });
+                ui.checkbox(&mut self.pad_sort, "по алфавиту");
+                ui.selectable_value(&mut self.cfg.pad_view, "Плитки".to_string(), "Плитки");
+                ui.selectable_value(&mut self.cfg.pad_view, "Список".to_string(), "Список");
+                let pp_text = if self.cfg.pad_per_page == 0 { "все".to_string() } else { format!("по {}", self.cfg.pad_per_page) };
+                egui::ComboBox::from_id_salt("pad_pp").width(80.0).selected_text(pp_text).show_ui(ui, |ui| {
+                    for v in [12u32, 24, 48, 96, 0] {
+                        let label = if v == 0 { "все".to_string() } else { format!("по {v}") };
+                        ui.selectable_value(&mut self.cfg.pad_per_page, v, label);
+                    }
+                });
+            });
+
+            // ── какие звуки показывать ──
+            let q = self.pad_search.trim().to_lowercase();
+            let mut vis: Vec<usize> = (0..n)
+                .filter(|&i| {
+                    let s = &self.cfg.sounds[i];
+                    let g = s.group.trim();
+                    let in_group = self.pad_group.is_empty()
+                        || (self.pad_group == NO_GROUP && g.is_empty())
+                        || g == self.pad_group;
+                    in_group
+                        && (q.is_empty()
+                            || s.name.to_lowercase().contains(&q)
+                            || g.to_lowercase().contains(&q)
+                            || s.key.to_lowercase().contains(&q))
+                })
+                .collect();
+            if self.pad_sort {
+                vis.sort_by_key(|&i| self.cfg.sounds[i].name.to_lowercase());
             }
-            if let Some(i) = remove {
-                self.cfg.sounds.remove(i);
-                self.capture = None;
+
+            // ── страницы ──
+            let pp = self.cfg.pad_per_page as usize;
+            let fsig = format!("{q}|{}|{}|{pp}", self.pad_group, self.pad_sort);
+            if fsig != self.pad_filter_sig {
+                self.pad_filter_sig = fsig;
+                self.pad_page = 0;
+            }
+            let pages = if pp == 0 { 1 } else { ((vis.len() + pp - 1) / pp).max(1) };
+            if self.pad_page >= pages {
+                self.pad_page = pages - 1;
+            }
+            let (a, b) = if pp == 0 {
+                (0, vis.len())
+            } else {
+                (self.pad_page * pp, ((self.pad_page + 1) * pp).min(vis.len()))
+            };
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("найдено {} · страница {} из {}", vis.len(), self.pad_page + 1, pages))
+                        .small()
+                        .color(pal().dim),
+                );
+                if pages > 1 {
+                    if ui.add_enabled(self.pad_page > 0, egui::Button::new("Назад")).clicked() {
+                        self.pad_page -= 1;
+                    }
+                    if ui.add_enabled(self.pad_page + 1 < pages, egui::Button::new("Далее")).clicked() {
+                        self.pad_page += 1;
+                    }
+                }
+            });
+            ui.add_space(4.0);
+
+            let items: Vec<usize> = vis[a..b].to_vec();
+            if items.is_empty() {
+                ui.label(RichText::new("Ничего не найдено.").color(pal().dim));
+            } else if self.cfg.pad_view == "Список" {
+                let last = items.len() - 1;
+                for (k, &i) in items.iter().enumerate() {
+                    self.sound_row(ui, i);
+                    if k < last {
+                        ui.add_space(2.0);
+                        ui.separator();
+                    }
+                }
+            } else {
+                let tile_w = 150.0_f32;
+                let cols = (((ui.available_width() + 8.0) / (tile_w + 8.0)).floor() as usize).max(1);
+                egui::Grid::new("pad_tiles").spacing([8.0, 8.0]).show(ui, |ui| {
+                    for (k, &i) in items.iter().enumerate() {
+                        self.sound_tile(ui, i, tile_w);
+                        if (k + 1) % cols == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
             }
         });
+
+        if let Some(i) = self.pad_remove.take() {
+            if i < self.cfg.sounds.len() {
+                self.cfg.sounds.remove(i);
+            }
+            self.capture = None;
+        }
         ui.add_space(4.0);
         for m in &self.hk_msgs {
             ui.label(RichText::new(format!("Бинд не работает: {m}")).small().color(YELLOW));
         }
+    }
+
+    /// Плитка звука: клик — играть, правый клик — настройки.
+    fn sound_tile(&mut self, ui: &mut egui::Ui, i: usize, w: f32) {
+        let (path, name, key, group) = {
+            let s = &self.cfg.sounds[i];
+            (s.path.clone(), s.name.clone(), s.key.clone(), s.group.trim().to_string())
+        };
+        let playing = self.shared.pad.is_playing(&path);
+        let capturing = self.capture == Some(Target::Sound(i));
+        let (rect, resp) = ui.allocate_exact_size(vec2(w, 60.0), Sense::click());
+        let p = pal();
+        let fill = if playing {
+            p.accent.linear_multiply(0.35)
+        } else if resp.hovered() {
+            Color32::from_rgb(50, 50, 68)
+        } else {
+            Color32::from_rgb(38, 38, 52)
+        };
+        let border = if capturing {
+            YELLOW
+        } else if playing {
+            p.accent_light
+        } else {
+            p.border
+        };
+        {
+            let painter = ui.painter();
+            painter.rect_filled(rect, 10.0, fill);
+            painter.rect_stroke(rect, 10.0, Stroke::new(1.5_f32, border));
+            let clip = painter.with_clip_rect(rect.shrink2(vec2(6.0, 3.0)));
+            clip.text(
+                rect.left_top() + vec2(10.0, 8.0),
+                egui::Align2::LEFT_TOP,
+                &name,
+                egui::FontId::proportional(14.0),
+                Color32::WHITE,
+            );
+            let (sub, sub_col) = if capturing {
+                ("нажмите сочетание…".to_string(), YELLOW)
+            } else if key.is_empty() {
+                ("без бинда".to_string(), p.dim)
+            } else {
+                (key.clone(), p.accent_light)
+            };
+            clip.text(
+                rect.left_bottom() + vec2(10.0, -7.0),
+                egui::Align2::LEFT_BOTTOM,
+                sub,
+                egui::FontId::proportional(12.0),
+                sub_col,
+            );
+            if !group.is_empty() {
+                clip.text(
+                    rect.right_bottom() + vec2(-8.0, -7.0),
+                    egui::Align2::RIGHT_BOTTOM,
+                    &group,
+                    egui::FontId::proportional(11.0),
+                    p.dim,
+                );
+            }
+        }
+        let resp = resp.on_hover_text(format!("{path}\nПравый клик — настройки звука"));
+        if resp.clicked() {
+            self.play_sound(i);
+        }
+        resp.context_menu(|ui| {
+            self.sound_menu(ui, i);
+        });
+    }
+
+    fn sound_menu(&mut self, ui: &mut egui::Ui, i: usize) {
+        ui.set_min_width(270.0);
+        ui.label(RichText::new("Название").small().color(pal().dim));
+        ui.add(TextEdit::singleline(&mut self.cfg.sounds[i].name).desired_width(250.0));
+        ui.label(RichText::new("Группа").small().color(pal().dim));
+        ui.add(TextEdit::singleline(&mut self.cfg.sounds[i].group).hint_text("без группы").desired_width(250.0));
+        ui.horizontal(|ui| {
+            ui.label("Громкость");
+            ui.add(
+                egui::Slider::new(&mut self.cfg.sounds[i].volume, 0.0..=3.0)
+                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                    .custom_parser(|s| s.trim().trim_end_matches('%').parse::<f64>().ok().map(|x| x / 100.0)),
+            );
+        });
+        ui.checkbox(&mut self.cfg.sounds[i].looped, "зациклить (повторное нажатие — стоп)");
+        ui.horizontal(|ui| {
+            ui.label("Режим");
+            mode_combo(ui, ("pad_mode_menu", i), &mut self.cfg.sounds[i].exclusive);
+        });
+        ui.horizontal(|ui| {
+            let key = self.cfg.sounds[i].key.clone();
+            self.key_button(ui, Target::Sound(i), &key);
+        });
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("Играть").clicked() {
+                self.play_sound(i);
+            }
+            if ui.button("Удалить звук").clicked() {
+                self.pad_remove = Some(i);
+                ui.close_menu();
+            }
+        });
+    }
+
+    /// Строка звука в режиме «Список».
+    fn sound_row(&mut self, ui: &mut egui::Ui, i: usize) {
+        ui.horizontal(|ui| {
+            ui.add(TextEdit::singleline(&mut self.cfg.sounds[i].name).desired_width(170.0));
+            if ui.button("Играть").clicked() {
+                self.play_sound(i);
+            }
+            let key = self.cfg.sounds[i].key.clone();
+            self.key_button(ui, Target::Sound(i), &key);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if icon_btn(ui, Ic::Close) {
+                    self.pad_remove = Some(i);
+                }
+            });
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Громкость");
+            ui.add(
+                egui::Slider::new(&mut self.cfg.sounds[i].volume, 0.0..=3.0)
+                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                    .custom_parser(|s| s.trim().trim_end_matches('%').parse::<f64>().ok().map(|x| x / 100.0)),
+            );
+            ui.checkbox(&mut self.cfg.sounds[i].looped, "зациклить");
+            mode_combo(ui, ("pad_mode_row", i), &mut self.cfg.sounds[i].exclusive);
+            ui.add(TextEdit::singleline(&mut self.cfg.sounds[i].group).hint_text("группа").desired_width(100.0));
+        });
+        ui.label(RichText::new(&self.cfg.sounds[i].path).small().color(pal().dim));
     }
 
     fn ui_binds(&mut self, ui: &mut egui::Ui) {
@@ -874,6 +1119,87 @@ impl App {
     }
 
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
+        let info = self.shared.info.lock().unwrap().clone();
+        let shared = self.shared.clone();
+
+        // ── Выход ──
+        card(ui, "Выход · виртуальный кабель", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Имя содержит:");
+                ui.add(TextEdit::singleline(&mut self.cfg.output).desired_width(190.0));
+                egui::ComboBox::from_id_salt("out_pick").selected_text("Выбрать…").show_ui(ui, |ui| {
+                    for d in &info.out_devices {
+                        if ui.selectable_label(false, d).clicked() {
+                            self.cfg.output = d.clone();
+                        }
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Итоговый уровень").small().color(pal().dim));
+                meter(ui, shared.out_level(), ui.available_width());
+            });
+        });
+
+        // ── Прослушивание ──
+        card(ui, "Прослушивание · что уходит в Line 2", |ui| {
+            ui.checkbox(&mut self.cfg.monitor_on, "Слышать итоговый микс в этом устройстве");
+            ui.horizontal(|ui| {
+                ui.label("Устройство:");
+                ui.add(TextEdit::singleline(&mut self.cfg.monitor_device).desired_width(190.0));
+                egui::ComboBox::from_id_salt("mon_pick").selected_text("Выбрать…").show_ui(ui, |ui| {
+                    for d in &info.out_devices {
+                        if ui.selectable_label(false, d).clicked() {
+                            self.cfg.monitor_device = d.clone();
+                        }
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.label("Громкость");
+                ui.add(
+                    egui::Slider::new(&mut self.cfg.monitor_volume, 0.0..=5.0)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                        .custom_parser(|s| s.trim().trim_end_matches('%').parse::<f64>().ok().map(|x| x / 100.0)),
+                );
+            });
+            if !info.monitor_status.is_empty() {
+                ui.label(RichText::new(&info.monitor_status).small().color(pal().dim));
+            }
+            ui.label(
+                RichText::new("Музыка в наушниках играет ещё и напрямую, поэтому здесь она может звучать с эхом — для проверки баланса это нормально.")
+                    .small()
+                    .color(pal().dim),
+            );
+        });
+
+        // ── Soundpad ──
+        card(ui, "Soundpad", |ui| {
+            ui.checkbox(&mut self.cfg.pad_exclusive, "Новый звук останавливает предыдущий (по умолчанию)");
+            ui.label(
+                RichText::new("Для отдельного звука можно выбрать другой режим: правый клик по плитке или список → «Режим».")
+                    .small()
+                    .color(pal().dim),
+            );
+            ui.checkbox(
+                &mut self.cfg.pad_allow_bare,
+                "Разрешить бинды звуков без Ctrl, Alt и Shift",
+            );
+            ui.label(
+                RichText::new("Одиночная клавиша перестанет работать в других программах, пока бинд задан. F1–F24 всегда разрешены.")
+                    .small()
+                    .color(pal().dim),
+            );
+            ui.horizontal(|ui| {
+                ui.label("Громкость новых звуков");
+                ui.add(
+                    egui::Slider::new(&mut self.cfg.pad_default_volume, 0.0..=3.0)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                        .custom_parser(|s| s.trim().trim_end_matches('%').parse::<f64>().ok().map(|x| x / 100.0)),
+                );
+            });
+        });
+
         card(ui, "Тема оформления", |ui| {
             ui.horizontal_wrapped(|ui| {
                 for (name, p) in THEMES.iter() {

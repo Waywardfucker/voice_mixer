@@ -31,6 +31,8 @@ struct Voice {
     vol: f32,
     looped: bool,
     path: String,
+    /// Звук «поверх»: его не останавливают звуки, запущенные в режиме «останавливает другие».
+    layer: bool,
 }
 
 struct CacheEntry {
@@ -142,19 +144,23 @@ impl Pad {
         voices.retain(|v| v.looped || v.pos < v.data.len());
     }
 
-    fn start(&self, data: Arc<Vec<f32>>, path: &str, vol: f32, looped: bool) {
+    fn start(&self, data: Arc<Vec<f32>>, path: &str, vol: f32, looped: bool, exclusive: bool, layer: bool) {
         if data.is_empty() {
             return;
         }
         let mut voices = self.voices.lock().unwrap();
+        if exclusive {
+            voices.retain(|v| v.layer);
+        }
         if voices.len() >= MAX_VOICES {
             voices.remove(0);
         }
-        voices.push(Voice { data, pos: 0, vol, looped, path: path.to_string() });
+        voices.push(Voice { data, pos: 0, vol, looped, path: path.to_string(), layer });
     }
 
     /// Запустить звук. Зацикленный звук при повторном вызове останавливается.
-    pub fn play(self: &Arc<Self>, path: &str, vol: f32, looped: bool) {
+    /// `exclusive` — остановить остальные звуки, `layer` — этот звук играет поверх и не прерывается другими.
+    pub fn play(self: &Arc<Self>, path: &str, vol: f32, looped: bool, exclusive: bool, layer: bool) {
         if looped && self.is_playing(path) {
             self.stop(path);
             return;
@@ -172,7 +178,7 @@ impl Pad {
             })
         };
         if let Some(d) = cached {
-            self.start(d, path, vol, looped);
+            self.start(d, path, vol, looped, exclusive, layer);
             return;
         }
         let me = self.clone();
@@ -183,7 +189,7 @@ impl Pad {
             Ok(d) => {
                 let d = Arc::new(d);
                 me.insert_cache((path.clone(), rate), d.clone());
-                me.start(d, &path, vol, looped);
+                me.start(d, &path, vol, looped, exclusive, layer);
                 me.status.lock().unwrap().clear();
             }
             Err(e) => {
